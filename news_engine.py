@@ -1,91 +1,231 @@
 import time
 import random
+import os
+import urllib.parse
 from datetime import datetime
 import db_manager
+import feedparser
+import google.generativeai as genai
+from dotenv import load_dotenv
+from bs4 import BeautifulSoup
+import json
+import image_processor
 
-# --- Mock Constants ---
-MOCK_HEADLINES = [
-    "Lakers Secure Tight Win Over Warriors",
-    "Mbappe Set to Join Real Madrid This Summer",
-    "Novak Djokovic Advances to Australian Open Final",
-    "Ferrari Unveils 2026 F1 Car Concept",
-    "Caitlin Clark Breaks WNBA Scoring Record"
-]
 
-MOCK_SUMMARIES = [
-    "In a thrilling encounter at the Crypto.com Arena, the Lakers edged out the Warriors 112-110.",
-    "The transfer saga finally comes to an end as reports confirm Mbappe has signed a pre-contract.",
-    "The world number one showed dominance in the semi-final, winning in straight sets.",
-    "The Italian team reveals a radical new design aimed at reclaiming the championship title.",
-    "The rookie sensation continues to rewrite history books with a 45-point performance."
-]
+# Load environment variables
+load_dotenv()
+
+# --- Constants ---
+RSS_FEED_URL = "https://cointelegraph.com/rss"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Configure Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("WARNING: GEMINI_API_KEY not found in environment variables.")
+
+
+def clean_html(html_content):
+    """Removes HTML tags from the string."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    return soup.get_text(separator=" ", strip=True)
 
 def fetch_rss_news():
-    """Mocks fetching news from RSS feeds."""
-    print("Fetching news from RSS feeds...")
-    # Simulate network delay
-    time.sleep(1)
+    """Fetches news from Cointelegraph RSS feed."""
+    print(f"Fetching news from {RSS_FEED_URL}...")
+    
+    feed = feedparser.parse(RSS_FEED_URL)
+    
+    if feed.bozo:
+        print("Error parsing RSS feed")
+        return []
     
     news_items = []
-    for i in range(3):
-        idx = random.randint(0, len(MOCK_HEADLINES) - 1)
+    # Fetch top 10 items for AI selection
+    for entry in feed.entries[:10]:
+        
+        # Try to find an existing image or use placeholder
+        image_url = "https://via.placeholder.com/1024x1024?text=News+Image"
+        
+        if 'media_content' in entry:
+            image_url = entry.media_content[0]['url']
+        elif 'links' in entry:
+            for link in entry.links:
+                if link.get('type') in ['image/jpeg', 'image/png']:
+                    image_url = link['href']
+                    break
+        
+        # Clean the summary
+        clean_summary = clean_html(entry.summary)
+
         news_items.append({
-            "title": MOCK_HEADLINES[idx],
-            "url": f"https://example.com/sports-news-{random.randint(1000, 9999)}"
+            "title": entry.title,
+            "url": entry.link,
+            "summary": clean_summary,
+            "published": entry.published,
+            "image_url": image_url
         })
+        
+    print(f"Fetched {len(news_items)} items.")
     return news_items
 
-def generate_ai_content(original_title):
-    """Mocks generating AI rewritten content and status."""
-    print(f"Generating AI content for: {original_title}")
-    # Simulate AI processing
-    time.sleep(1.5)
+def select_interesting_news(news_items, top_n=3):
+    """
+    Uses Gemini AI to select the most interesting news items.
+    Returns: List of top N interesting news items
+    """
+    if not GEMINI_API_KEY or not news_items:
+        # Fallback: return first N items
+        return news_items[:top_n]
     
-    idx = random.randint(0, len(MOCK_SUMMARIES) - 1)
-    rewritten_summary = f"AI BREAKING: {MOCK_SUMMARIES[idx]} (Rewritten from '{original_title}')"
+    print(f"Using Gemini AI to select top {top_n} interesting news...")
     
-    # Mock image path (in a real app, this would be a path to a generated file)
-    mock_image_url = f"https://picsum.photos/seed/{random.randint(1, 1000)}/800/600"
-    
-    return rewritten_summary, mock_image_url
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        # Create a prompt with all news items
+        news_list = ""
+        for i, item in enumerate(news_items, 1):
+            news_list += f"{i}. {item['title']}\n   Summary: {item['summary'][:150]}...\n\n"
+        
+        prompt = f"""
+        You are a crypto news curator for a Thai audience interested in blockchain and cryptocurrency.
+        
+        From the following {len(news_items)} news items, select the top {top_n} most interesting and important stories.
+        Consider: impact, relevance, novelty, and reader interest.
+        
+        News Items:
+        {news_list}
+        
+        Return ONLY a JSON array of the numbers (1-{len(news_items)}) of the top {top_n} stories.
+        Example: [3, 7, 1]
+        """
+        
+        response = model.generate_content(prompt)
+        
+        # Parse response
+        selected_indices = json.loads(response.text.strip())
+        
+        # Convert to 0-indexed and get selected items
+        selected_news = [news_items[idx - 1] for idx in selected_indices if 1 <= idx <= len(news_items)]
+        
+        print(f"Selected {len(selected_news)} interesting news items")
+        return selected_news[:top_n]
+        
+    except Exception as e:
+        print(f"AI selection error: {e}")
+        # Fallback
+        return news_items[:top_n]
 
-def post_to_facebook(item_id, content, image_url):
-    """Mocks posting to Facebook API."""
-    print(f"Posting item {item_id} to Facebook...")
-    # Simulate API call
-    time.sleep(2)
+def generate_thai_content(original_title, original_summary):
+    """
+    Uses Gemini to generate Thai headline and content.
+    Returns: (thai_headline, thai_content)
+    """
+    if not GEMINI_API_KEY:
+        return f"[NO KEY] {original_title}", f"[NO KEY] {original_summary}"
     
-    # In a real scenario, you'd use requests to hit FB Graph API
-    # requests.post(f"https://graph.facebook.com/v19.0/me/feed", data={...})
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        prompt = f"""
+        คุณเป็นนักเขียนข่าว crypto/blockchain สำหรับชาวไทย
+        
+        ข่าวต้นฉบับ (ภาษาอังกฤษ):
+        หัวข้อ: {original_title}
+        สรุป: {original_summary}
+        
+        กรุณาสร้าง:
+        1. HEADLINE: หัวข้อภาษาไทยสั้นๆ กระชับ น่าสนใจ (ไม่เกิน 50 ตัวอักษร)
+        2. CONTENT: เนื้อหาภาษาไทยที่ละเอียด อ่านง่าย เข้าใจง่าย น่าสนใจ สำหรับโพสต์ Facebook 
+           - ยาว 200-300 คำ
+           - อธิบายรายละเอียดให้ครบถ้วน
+           - มีข้อมูลที่น่าสนใจ
+           - เหมาะสำหรับคนที่สนใจ crypto
+        
+        ตอบกลับในรูปแบบ JSON:
+        {{
+          "headline": "หัวข้อภาษาไทย",
+          "content": "เนื้อหาภาษาไทยแบบยาว ละเอียด"
+        }}
+        """
+        
+        response = model.generate_content(prompt)
+        result = json.loads(response.text.strip())
+        
+        return result.get("headline", original_title), result.get("content", original_summary)
+        
+    except Exception as e:
+        print(f"Thai content generation error: {e}")
+        return f"[ERROR] {original_title}", f"[ERROR] {original_summary}"
+
+def process_news_item(news_item):
+    """
+    Processes a single news item: generates Thai content and branded image.
+    Returns: (thai_headline, thai_content, image_path)
+    """
+    print(f"Processing: {news_item['title']}")
     
-    return True
+    # Generate Thai content
+    thai_headline, thai_content = generate_thai_content(news_item['title'], news_item['summary'])
+    
+    # Create branded image with Thai headline
+    image_path = None
+    try:
+        image_path = image_processor.add_headline_to_image(
+            news_item['image_url'],
+            thai_headline,
+            output_path=None  # Auto-generate path
+        )
+        print(f"Generated branded image: {image_path}")
+    except Exception as e:
+        print(f"Image processing error: {e}")
+        # Fallback to original image
+        image_path = news_item['image_url']
+    
+    return thai_headline, thai_content, image_path
 
 def trigger_news_workflow(auto_post=False):
-    """Orchestrates the fetching, generating, and saving process."""
+    """Orchestrates the enhanced news workflow."""
+    # 1. Fetch news
     raw_news = fetch_rss_news()
     
-    for item in raw_news:
-        summary, image_path = generate_ai_content(item['title'])
+    if not raw_news:
+        print("No news fetched")
+        return 0
+    
+    # 2. AI selects interesting news
+    selected_news = select_interesting_news(raw_news, top_n=3)
+    
+    # 3. Process each selected item
+    count = 0
+    for item in selected_news:
+        try:
+            thai_headline, thai_content, image_path = process_news_item(item)
+            
+            # Rate limiting for Gemini Free Tier
+            if GEMINI_API_KEY:
+                time.sleep(20)  # Conservative delay for free tier
+            
+            status = 'posted' if auto_post else 'pending'
+            
+            db_manager.add_news_item(
+                title=thai_headline,  # Use Thai headline as title
+                summary=thai_content,  # Thai content as summary
+                image_path=image_path,  # Branded image path
+                url=item['url'],
+                status=status
+            )
+            count += 1
+            
+        except Exception as e:
+            print(f"Error processing news item: {e}")
+            continue
         
-        status = 'posted' if auto_post else 'pending'
-        
-        db_manager.add_news_item(
-            title=item['title'],
-            summary=summary,
-            image_path=image_path,
-            url=item['url'],
-            status=status
-        )
-        
-        if status == 'posted':
-            # Get the newly added item's ID (this is simplified)
-            # In a real app, get the ID from the cursor after insertion
-            print(f"Automatically posted: {item['title']}")
-            # In this mock, we just proceed as if it's posted
-
-    return len(raw_news)
+    return count
 
 if __name__ == "__main__":
-    # Test workflow
     count = trigger_news_workflow(auto_post=False)
     print(f"Processed {count} news items.")
+
